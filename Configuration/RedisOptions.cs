@@ -1,0 +1,11 @@
+namespace KafkaToRedis.Configuration;
+
+/// <summary>
+/// Strongly-typed options for the Redis connection.
+/// Bound from the "Redis" configuration section.
+/// Override with environment variable <c>Redis__ConnectionString</c>.
+/// </summary>
+public sealed class RedisOptions
+{
+    public string ConnectionString { get; init; } = "localhost:6379";
+}
