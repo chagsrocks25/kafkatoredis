@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using Confluent.Kafka;
 using KafkaToRedis.Configuration;
 using KafkaToRedis.Domain;
@@ -64,7 +65,7 @@ public sealed class KafkaConsumerService : IKafkaConsumerService, IDisposable
         // Do NOT replace with Dictionary; deduplication mid-batch would silently
         // drop intermediate updates before the flush, which could violate
         // last-write-wins if a record for the same key appears in the next batch.
-        var batch            = new List<(string RedisKey, PlayerScoreData? Data)>();
+        var batch = ImmutableList<BatchRecord>.Empty;
         var partitionOffsets = new Dictionary<TopicPartition, Offset>();
         var batchStartTime   = DateTime.UtcNow;
 
@@ -79,11 +80,11 @@ public sealed class KafkaConsumerService : IKafkaConsumerService, IDisposable
                     var result = _consumer.Consume(TimeSpan.FromMilliseconds(200));
 
                     if (result?.Message is not null)
-                        AccumulateRecord(result, batch, partitionOffsets);
+                        AccumulateRecord(result, ref batch, partitionOffsets);
 
                     if (ShouldFlush(batch.Count, partitionOffsets.Count, batchStartTime))
                     {
-                        await FlushAsync(batch, partitionOffsets, cancellationToken);
+                        batch = await FlushAsync(batch, partitionOffsets, cancellationToken);
                         batchStartTime = DateTime.UtcNow;
                     }
                 }
@@ -108,9 +109,9 @@ public sealed class KafkaConsumerService : IKafkaConsumerService, IDisposable
     // -------------------------------------------------------------------------
 
     private void AccumulateRecord(
-        ConsumeResult<string, string>                   result,
-        List<(string RedisKey, PlayerScoreData? Data)>  batch,
-        Dictionary<TopicPartition, Offset>               partitionOffsets)
+        ConsumeResult<string, string>  result,
+        ref ImmutableList<BatchRecord> batch,
+        Dictionary<TopicPartition, Offset> partitionOffsets)
     {
         var redisKey = _keyMapper.Map(result.Message.Key);
         if (redisKey is null)
@@ -120,21 +121,33 @@ public sealed class KafkaConsumerService : IKafkaConsumerService, IDisposable
             return;
         }
 
-        PlayerScoreData? data = null;
-        if (result.Message.Value is not null)
+        if (result.Message.Value is null)
         {
-            data = _deserializer.Deserialize(result.Message.Value);
-            if (data is null)
-            {
-                _logger.LogWarning(
-                    "Skipping record — deserialization returned null for key '{Key}'.",
-                    result.Message.Key);
-                return;
-            }
+            // Tombstone — null Kafka value in a compacted topic means delete from Redis.
+            batch = batch.Add(BatchRecord.ForDelete(redisKey));
+            partitionOffsets[result.TopicPartition] = result.Offset + 1;
+            return;
         }
-        // data == null → tombstone message (null Kafka value in a compacted topic)
 
-        batch.Add((redisKey, data));
+        TryAccumulateWrite(result, redisKey, ref batch, partitionOffsets);
+    }
+
+    private void TryAccumulateWrite(
+        ConsumeResult<string, string>  result,
+        string                         redisKey,
+        ref ImmutableList<BatchRecord> batch,
+        Dictionary<TopicPartition, Offset> partitionOffsets)
+    {
+        var data = _deserializer.Deserialize(result.Message.Value);
+        if (data is null)
+        {
+            _logger.LogWarning(
+                "Skipping record — deserialization returned null for key '{Key}'.",
+                result.Message.Key);
+            return;
+        }
+
+        batch = batch.Add(BatchRecord.ForWrite(redisKey, data));
         partitionOffsets[result.TopicPartition] = result.Offset + 1;
     }
 
@@ -142,39 +155,55 @@ public sealed class KafkaConsumerService : IKafkaConsumerService, IDisposable
         batchCount >= _maxBatchSize ||
         (offsetCount > 0 && DateTime.UtcNow - batchStartTime >= _maxBatchDelay);
 
-    private async Task FlushAsync(
-        List<(string RedisKey, PlayerScoreData? Data)> batch,
-        Dictionary<TopicPartition, Offset>             partitionOffsets,
-        CancellationToken                              cancellationToken)
+    private async Task<ImmutableList<BatchRecord>> FlushAsync(
+        ImmutableList<BatchRecord>         batch,
+        Dictionary<TopicPartition, Offset> partitionOffsets,
+        CancellationToken                  cancellationToken)
     {
         // Sequential writes — last record for a given (key, scoreId) is the winner,
         // matching Kafka compaction semantics. Task.WhenAll is intentionally avoided.
-        foreach (var (redisKey, data) in batch)
+        // Per-record error handling prevents a single poison record from aborting the batch.
+        foreach (var record in batch)
         {
-            if (data is null)
-                await _repository.DeleteAsync(redisKey, cancellationToken);
-            else
-                await _repository.WriteAsync(redisKey, data, cancellationToken);
+            try
+            {
+                if (record.IsTombstone)
+                    await _repository.DeleteAsync(record.RedisKey, cancellationToken);
+                else
+                    await _repository.WriteAsync(record.RedisKey, record.Data, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                throw; // Propagate cancellation — do not swallow shutdown signals.
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(
+                    ex,
+                    "Failed to process record for key '{RedisKey}' (tombstone={IsTombstone}). Skipping.",
+                    record.RedisKey,
+                    record.IsTombstone);
+            }
         }
 
         _logger.LogInformation("Flushed {Count} record(s) to repository.", batch.Count);
-        batch.Clear();
 
         if (partitionOffsets.Count > 0)
         {
             var offsets = partitionOffsets
-                .Select(kvp => new TopicPartitionOffset(kvp.Key, kvp.Value))
-                .ToList();
+                .Select(kvp => new TopicPartitionOffset(kvp.Key, kvp.Value));
 
             _consumer.Commit(offsets);
-            _logger.LogDebug("Committed offsets for {Count} partition(s).", offsets.Count);
+            _logger.LogDebug("Committed offsets for {Count} partition(s).", partitionOffsets.Count);
             partitionOffsets.Clear();
         }
+
+        return ImmutableList<BatchRecord>.Empty;
     }
 
     private async Task FinalFlushAsync(
-        List<(string RedisKey, PlayerScoreData? Data)> batch,
-        Dictionary<TopicPartition, Offset>             partitionOffsets)
+        ImmutableList<BatchRecord>         batch,
+        Dictionary<TopicPartition, Offset> partitionOffsets)
     {
         if (batch.Count == 0 && partitionOffsets.Count == 0) return;
 

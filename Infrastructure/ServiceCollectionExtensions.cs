@@ -88,6 +88,9 @@ public static class ServiceCollectionExtensions
             return new LoggingScoreRepositoryDecorator(inner, logger);
         });
 
+        // --- Test data producer (used with --produce flag; no-op in normal consumer mode)
+        services.AddSingleton<ITestDataProducer, KafkaTestDataProducer>();
+
         // --- Consumer service ------------------------------------------------
         services.AddSingleton<IKafkaConsumerService, KafkaConsumerService>();
 

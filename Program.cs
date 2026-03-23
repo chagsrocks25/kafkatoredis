@@ -7,7 +7,15 @@ using Microsoft.Extensions.Logging;
 using StackExchange.Redis;
 
 // ---------------------------------------------------------------------------
-// Configuration
+// Mode detection  (default = consume)
+// Usage:
+//   dotnet run              → consume from Kafka and write to Redis
+//   dotnet run -- --produce → produce test scenario messages to Kafka
+// ---------------------------------------------------------------------------
+var isProduceMode = args.Contains("--produce");
+
+// ---------------------------------------------------------------------------
+// Configuration  (appsettings.json → env vars override)
 // ---------------------------------------------------------------------------
 IConfiguration configuration = new ConfigurationBuilder()
     .SetBasePath(AppContext.BaseDirectory)
@@ -19,7 +27,7 @@ var services = new ServiceCollection();
 services.AddLogging(b => b.AddConsole());
 
 // ---------------------------------------------------------------------------
-// Redis — requires async initialisation before the DI container is built
+// Redis — async connection must be done before the DI container is built
 // ---------------------------------------------------------------------------
 var redisOptions = configuration.GetSection("Redis").Get<RedisOptions>()
                    ?? new RedisOptions();
@@ -44,8 +52,11 @@ var logger   = provider.GetRequiredService<ILogger<Program>>();
 
 var kafkaOptions = configuration.GetSection("Kafka").Get<KafkaOptions>() ?? new KafkaOptions();
 logger.LogInformation(
-    "KafkaToRedis started. Topic={Topic} Brokers={Brokers} Redis={Redis}",
-    kafkaOptions.Topic, kafkaOptions.BootstrapServers, redisOptions.ConnectionString);
+    "KafkaToRedis starting — mode={Mode} topic={Topic} brokers={Brokers} redis={Redis}",
+    isProduceMode ? "PRODUCE" : "CONSUME",
+    kafkaOptions.Topic,
+    kafkaOptions.BootstrapServers,
+    redisOptions.ConnectionString);
 
 // ---------------------------------------------------------------------------
 // Graceful shutdown on Ctrl+C / SIGTERM
@@ -60,7 +71,17 @@ Console.CancelKeyPress += (_, e) =>
 // ---------------------------------------------------------------------------
 // Run
 // ---------------------------------------------------------------------------
-var consumerService = provider.GetRequiredService<IKafkaConsumerService>();
-await consumerService.ConsumeAsync(cts.Token);
+if (isProduceMode)
+{
+    // Produce the test scenario then exit — no long-running loop needed.
+    var testProducer = provider.GetRequiredService<ITestDataProducer>();
+    await testProducer.ProduceAsync(cts.Token);
+}
+else
+{
+    // Consume continuously until Ctrl+C.
+    var consumerService = provider.GetRequiredService<IKafkaConsumerService>();
+    await consumerService.ConsumeAsync(cts.Token);
+}
 
 logger.LogInformation("KafkaToRedis stopped cleanly.");

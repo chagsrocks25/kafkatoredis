@@ -36,6 +36,7 @@ public sealed class RedisScoreRepository : IScoreRepository
         PlayerScoreData data,
         CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         var entries = _hashMapper.Map(data);
         await _db.HashSetAsync(redisKey, entries);
         _logger.LogDebug(
@@ -47,6 +48,7 @@ public sealed class RedisScoreRepository : IScoreRepository
         string redisKey,
         CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         await _db.KeyDeleteAsync(redisKey);
         _logger.LogDebug("Deleted key {Key}.", redisKey);
     }

@@ -18,6 +18,11 @@ public sealed class PlayerScoreHashMapper : IRedisHashMapper<PlayerScoreData>
     /// <inheritdoc/>
     public HashEntry[] Map(PlayerScoreData data)
     {
+        if (string.IsNullOrEmpty(data.ScoreId))
+            throw new ArgumentException(
+                "ScoreId must not be null or empty — it is used as the Redis hash field prefix.",
+                nameof(data));
+
         var scorePrefix = data.ScoreId; // field prefix, e.g. "playtime"
 
         return
