@@ -12,9 +12,10 @@ public interface IMessageDeserializer<TDomain>
     where TDomain : class
 {
     /// <summary>
-    /// Deserialises <paramref name="rawPayload"/> into <typeparamref name="TDomain"/>.
-    /// Returns <c>null</c> when the payload cannot be deserialised (implementations
-    /// should log a warning and allow the caller to skip the record).
+    /// Attempts to deserialise <paramref name="rawPayload"/> into <typeparamref name="TDomain"/>.
+    /// Returns <c>true</c> and sets <paramref name="result"/> on success;
+    /// returns <c>false</c> on invalid/unparseable payloads (implementations should log
+    /// a warning and allow the caller to skip the record).
     /// </summary>
-    TDomain? Deserialize(string? rawPayload);
+    bool TryDeserialize(string rawPayload, out TDomain result);
 }

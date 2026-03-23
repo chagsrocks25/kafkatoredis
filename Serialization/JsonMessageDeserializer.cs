@@ -9,7 +9,7 @@ namespace KafkaToRedis.Serialization;
 /// </summary>
 public sealed class JsonMessageDeserializer : IMessageDeserializer<PlayerScoreData>
 {
-    private static readonly JsonSerializerOptions _jsonOptions = new()
+    private static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
     };
@@ -20,19 +20,26 @@ public sealed class JsonMessageDeserializer : IMessageDeserializer<PlayerScoreDa
         _logger = logger;
 
     /// <inheritdoc/>
-    public PlayerScoreData? Deserialize(string? rawPayload)
+    public bool TryDeserialize(string rawPayload, out PlayerScoreData result)
     {
-        if (rawPayload is null)
-            return null;
-
         try
         {
-            return JsonSerializer.Deserialize<PlayerScoreData>(rawPayload, _jsonOptions);
+            var deserialized = JsonSerializer.Deserialize<PlayerScoreData>(rawPayload, JsonOptions);
+            if (deserialized is not null)
+            {
+                result = deserialized;
+                return true;
+            }
+
+            _logger.LogWarning("JSON deserialization produced null for payload.");
+            result = default!;
+            return false;
         }
         catch (JsonException ex)
         {
             _logger.LogWarning("JSON deserialization failed: {Message}", ex.Message);
-            return null;
+            result = default!;
+            return false;
         }
     }
 }

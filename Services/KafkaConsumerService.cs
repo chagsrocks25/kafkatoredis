@@ -113,8 +113,7 @@ public sealed class KafkaConsumerService : IKafkaConsumerService, IDisposable
         ref ImmutableList<BatchRecord> batch,
         Dictionary<TopicPartition, Offset> partitionOffsets)
     {
-        var redisKey = _keyMapper.Map(result.Message.Key);
-        if (redisKey is null)
+        if (!_keyMapper.TryMap(result.Message.Key, out var redisKey))
         {
             _logger.LogWarning(
                 "Skipping record — unmappable Kafka key '{Key}'.", result.Message.Key);
@@ -138,11 +137,10 @@ public sealed class KafkaConsumerService : IKafkaConsumerService, IDisposable
         ref ImmutableList<BatchRecord> batch,
         Dictionary<TopicPartition, Offset> partitionOffsets)
     {
-        var data = _deserializer.Deserialize(result.Message.Value);
-        if (data is null)
+        if (!_deserializer.TryDeserialize(result.Message.Value, out var data))
         {
             _logger.LogWarning(
-                "Skipping record — deserialization returned null for key '{Key}'.",
+                "Skipping record — deserialization failed for key '{Key}'.",
                 result.Message.Key);
             return;
         }

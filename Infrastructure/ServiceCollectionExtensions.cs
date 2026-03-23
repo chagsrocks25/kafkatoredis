@@ -7,7 +7,6 @@ using KafkaToRedis.Serialization;
 using KafkaToRedis.Services;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace KafkaToRedis.Infrastructure;
@@ -76,17 +75,10 @@ public static class ServiceCollectionExtensions
         // Swap to add/remove fields or change the Redis hash schema.
         services.AddSingleton<IRedisHashMapper<PlayerScoreData>, PlayerScoreHashMapper>();
 
-        // --- Repository with logging decorator -------------------------------
-        // RedisScoreRepository is registered as a concrete type so the decorator
-        // factory can resolve it directly.  Add further decorators (retry, metrics,
-        // circuit-breaker) by wrapping the previous layer the same way.
-        services.AddSingleton<RedisScoreRepository>();
-        services.AddSingleton<IScoreRepository>(sp =>
-        {
-            var inner  = sp.GetRequiredService<RedisScoreRepository>();
-            var logger = sp.GetRequiredService<ILogger<LoggingScoreRepositoryDecorator>>();
-            return new LoggingScoreRepositoryDecorator(inner, logger);
-        });
+        // --- Repository -------------------------------------------------------
+        // Swap to target a different data store (DynamoDB, Cassandra, etc.)
+        // by registering a different IScoreRepository implementation here.
+        services.AddSingleton<IScoreRepository, RedisScoreRepository>();
 
         // --- Test data producer (used with --produce flag; no-op in normal consumer mode)
         services.AddSingleton<ITestDataProducer, KafkaTestDataProducer>();

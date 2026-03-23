@@ -13,11 +13,16 @@ namespace KafkaToRedis.Mapping;
 public sealed class PlatformAccountKeyMapper : IRedisKeyMapper
 {
     /// <inheritdoc/>
-    public string? Map(string kafkaKey)
+    public bool TryMap(string kafkaKey, out string redisKey)
     {
         var id = new PlatformAccountId(kafkaKey);
-        return id.IsValid
-            ? $"sbmm:{id.AccountId}:{id.PlatformId}"
-            : null;
+        if (id.IsValid)
+        {
+            redisKey = $"sbmm:{id.AccountId}:{id.PlatformId}";
+            return true;
+        }
+
+        redisKey = string.Empty;
+        return false;
     }
 }

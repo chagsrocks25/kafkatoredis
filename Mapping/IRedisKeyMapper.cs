@@ -10,9 +10,9 @@ namespace KafkaToRedis.Mapping;
 public interface IRedisKeyMapper
 {
     /// <summary>
-    /// Maps <paramref name="kafkaKey"/> to a Redis key.
-    /// Returns <c>null</c> when the key is invalid or cannot be mapped; the
-    /// consumer will skip the record in that case.
+    /// Attempts to map <paramref name="kafkaKey"/> to a Redis key.
+    /// Returns <c>true</c> and sets <paramref name="redisKey"/> on success;
+    /// returns <c>false</c> when the key is invalid or cannot be mapped.
     /// </summary>
-    string? Map(string kafkaKey);
+    bool TryMap(string kafkaKey, out string redisKey);
 }
