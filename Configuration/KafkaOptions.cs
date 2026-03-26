@@ -17,4 +17,7 @@ public sealed class KafkaOptions
 
     /// <summary>Maximum seconds to wait before flushing a non-empty batch.</summary>
     public int MaxBatchDelaySeconds    { get; init; } = 2;
+
+    /// <summary>Whether to fail the application on unmappable keys or deserialization failures.</summary>
+    public bool FailOnProcessingError  { get; init; } = false;
 }

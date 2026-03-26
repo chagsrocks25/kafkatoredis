@@ -40,6 +40,7 @@ public sealed class KafkaConsumerService : IKafkaConsumerService, IDisposable
     private readonly ILogger<KafkaConsumerService>        _logger;
     private readonly int      _maxBatchSize;
     private readonly TimeSpan _maxBatchDelay;
+    private readonly bool     _failOnProcessingError;
 
     public KafkaConsumerService(
         IConsumer<string, string>             consumer,
@@ -54,8 +55,9 @@ public sealed class KafkaConsumerService : IKafkaConsumerService, IDisposable
         _keyMapper     = keyMapper;
         _repository    = repository;
         _logger        = logger;
-        _maxBatchSize  = kafkaOptions.Value.MaxBatchSize;
-        _maxBatchDelay = TimeSpan.FromSeconds(kafkaOptions.Value.MaxBatchDelaySeconds);
+        _maxBatchSize          = kafkaOptions.Value.MaxBatchSize;
+        _maxBatchDelay         = TimeSpan.FromSeconds(kafkaOptions.Value.MaxBatchDelaySeconds);
+        _failOnProcessingError = kafkaOptions.Value.FailOnProcessingError;
     }
 
     /// <inheritdoc/>
@@ -115,8 +117,17 @@ public sealed class KafkaConsumerService : IKafkaConsumerService, IDisposable
     {
         if (!_keyMapper.TryMap(result.Message.Key, out var redisKey))
         {
+            if (_failOnProcessingError)
+            {
+                throw new InvalidOperationException(
+                    $"Failing on unmappable Kafka key '{result.Message.Key}' at offset {result.Offset} as configured.");
+            }
+
             _logger.LogWarning(
                 "Skipping record — unmappable Kafka key '{Key}'.", result.Message.Key);
+            
+            // Advance past it only if we're ignoring errors 
+            partitionOffsets[result.TopicPartition] = result.Offset + 1;
             return;
         }
 
@@ -139,9 +150,18 @@ public sealed class KafkaConsumerService : IKafkaConsumerService, IDisposable
     {
         if (!_deserializer.TryDeserialize(result.Message.Value, out var data))
         {
+            if (_failOnProcessingError)
+            {
+                throw new InvalidOperationException(
+                    $"Failing on deserialization error for key '{result.Message.Key}' at offset {result.Offset} as configured.");
+            }
+
             _logger.LogWarning(
                 "Skipping record — deserialization failed for key '{Key}'.",
                 result.Message.Key);
+            
+            // Advance past it only if we're ignoring errors 
+            partitionOffsets[result.TopicPartition] = result.Offset + 1;
             return;
         }
 
