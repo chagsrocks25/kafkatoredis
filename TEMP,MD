@@ -1,0 +1,209 @@
+
+
+---
+
+## Functional Requirements
+
+### Inputs
+
+The tool accepts the following runtime inputs, provided via command-line arguments or a configuration object:
+
+| Parameter | Description |
+|---|---|
+| `env` | Deployment environment (e.g., `dev`, `prod`) |
+| `title` | Game title identifier (e.g., `hgt`, `rdr2`) |
+| `subject` | Kafka subject prefix (env is appended at runtime) |
+| `schemaFile` | Filename of the XML config (must be in same directory as executable) |
+| `registryUrl` | URL of the Confluent Schema Registry |
+| `updateRegistry` | Boolean flag; if true, schemas are pushed to registry. If false, dry-run only. |
+
+The XML config file follows the `LeaderboardsConfiguration` schema, containing `StatGroups`, `Inputs`, `Categories`, and `CategoryPermutations` sections.
+
+### Outputs
+
+- One Avro schema (JSON) is generated per `StatGroup` found in the XML.
+- All schemas are written to a single local file: `{subject}_avro_schema.json`.
+- If `updateRegistry` is true, each schema is registered to the Schema Registry under the subject: `{subject}-{statGroupName}-value`.
+- Console output is produced at each major step for observability.
+
+### Dry Run Mode
+
+When `updateRegistry` is false, the tool builds and writes schemas locally but does not call the Schema Registry. This is the default safe mode.
+
+---
+
+## Code Design
+
+### Project Structure
+
+```
+AvroBootstrapper/
+├── Interfaces/
+│   ├── IXmlParser.cs
+│   ├── IAvroSchemaBuilder.cs
+│   ├── ITypeMapper.cs
+│   ├── ISchemaRegistrar.cs
+│   └── IBootstrapperApp.cs
+├── Services/
+│   ├── XmlParser.cs
+│   ├── AvroSchemaBuilder.cs
+│   ├── TypeMapper.cs
+│   ├── SchemaRegistrar.cs
+│   └── BootstrapperApp.cs
+├── Models/
+│   ├── BootstrapperOptions.cs
+│   └── AvroField.cs
+└── Program.cs
+```
+
+---
+
+### Models
+
+**`BootstrapperOptions`** — strongly-typed container for all CLI/config inputs.
+
+```csharp
+public class BootstrapperOptions
+{
+    public string Env { get; set; }
+    public string Title { get; set; }
+    public string Subject { get; set; }
+    public string SchemaFile { get; set; }
+    public string RegistryUrl { get; set; }
+    public bool UpdateRegistry { get; set; }
+    public bool DryRun => !UpdateRegistry;
+    public string FullSubject => $"{Subject}_{Env}_{Title}";
+}
+```
+
+**`AvroField`** — represents a single field in an Avro record schema.
+
+```csharp
+public class AvroField
+{
+    public string Name { get; set; }
+    public object Type { get; set; }   // string or object[] for unions
+    public object Default { get; set; }
+}
+```
+
+---
+
+### Interfaces
+
+#### `IXmlParser`
+
+Responsible for reading the XML config file and converting it into a structured `Dictionary<string, object>` representation, equivalent to the Python `convert_xml_to_dict` / `convert_xml_to_json` logic.
+
+```csharp
+public interface IXmlParser
+{
+    Dictionary<string, object> ParseFile(string filePath);
+    Dictionary<string, object> ParseString(string xmlContent);
+}
+```
+
+---
+
+#### `ITypeMapper`
+
+Maps SQL/primitive type strings to their corresponding Avro type representation. Handles upcasting (e.g., float → double) and logical types (e.g., datetime → timestamp-millis).
+
+```csharp
+public interface ITypeMapper
+{
+    object GetAvroTypeForSqlType(string sqlType);
+}
+```
+
+Returns either a `string` (e.g., `"string"`, `"int"`) or a `Dictionary<string, string>` for logical types (e.g., `{ "type": "long", "logicalType": "timestamp-millis" }`).
+
+---
+
+#### `IAvroSchemaBuilder`
+
+Core interface responsible for transforming the parsed XML dictionary into a list of Avro schema records — one per stat group.
+
+```csharp
+public interface IAvroSchemaBuilder
+{
+    List<Dictionary<string, object>> BuildAvroSchema(Dictionary<string, object> jsonData);
+}
+```
+
+Internally this orchestrates:
+- `GetBaseFieldSchema()` — builds the fixed base fields (handle, tag, time, guid, accountId, etc.)
+- `BuildCategories()` — resolves `CategoryPermutations` into Avro record fields
+- `BuildInputsAndAggregatedInputs()` — resolves `Columns` into input, aggregatedInputs, and aggregatedValues Avro record fields
+- `ProcessStatGroup()` — assembles a full Avro record for one stat group
+- `BuildComplexStatFields()` — resolves a single field by name from the Inputs/Categories data, with ratio fallback logic
+
+These are internal methods on `AvroSchemaBuilder` and do not need to be exposed on the interface.
+
+---
+
+#### `ISchemaRegistrar`
+
+Handles registration of compiled Avro schemas to the Schema Registry. Calls existing Schema Registry API clients in the codebase — no new HTTP logic is written here.
+
+```csharp
+public interface ISchemaRegistrar
+{
+    Task RegisterAsync(string subjectName, string avroSchemaJson);
+    void PrintSchema(string subjectName, string avroSchemaJson);
+}
+```
+
+---
+
+#### `IBootstrapperApp`
+
+Top-level orchestrator interface. Wires together parsing, building, file writing, and registration.
+
+```csharp
+public interface IBootstrapperApp
+{
+    Task RunAsync();
+}
+```
+
+The concrete `BootstrapperApp` takes all other interfaces via constructor injection (DI-friendly).
+
+---
+
+### Dependency Injection
+
+All interfaces are registered in `Program.cs` using .NET 8.0's built-in DI:
+
+```csharp
+var host = Host.CreateDefaultBuilder(args)
+    .ConfigureServices((ctx, services) =>
+    {
+        services.Configure<BootstrapperOptions>(ctx.Configuration);
+        services.AddSingleton<ITypeMapper, TypeMapper>();
+        services.AddSingleton<IXmlParser, XmlParser>();
+        services.AddSingleton<IAvroSchemaBuilder, AvroSchemaBuilder>();
+        services.AddSingleton<ISchemaRegistrar, SchemaRegistrar>();
+        services.AddSingleton<IBootstrapperApp, BootstrapperApp>();
+    })
+    .Build();
+
+await host.Services.GetRequiredService<IBootstrapperApp>().RunAsync();
+```
+
+---
+
+## Key Behavioural Notes
+
+- **Title-specific logic**: When `title == "rdr2"`, the stat dict includes a `posseInfo` field with a hardcoded `id: long` field. This is handled inside `ProcessStatGroup` with a simple conditional, identical to the Python version.
+- **Nullable Avro fields**: All fields use the union type `["null", <type>]` with `default: null`, matching the Python output.
+- **Type safety**: `object` is used for Avro `type` values since they can be strings or nested objects. Serialization to JSON uses `System.Text.Json`.
+- **Schema Registry calls**: `SchemaRegistrar` will call the existing `ISchemaRegistryClient` (already in codebase) — no new client is introduced.
+
+---
+
+## Out of Scope
+
+- No changes to Schema Registry API clients.
+- No XML schema validation (matches current Python behaviour).
+- No support for complex nested Avro types beyond what the Python tool currently handles (tracked as a ToDo in the original code).
