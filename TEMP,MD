@@ -1,6 +1,12 @@
+# Design Doc: XML Schema Bootstrapper for Profile Stat Groups (.NET 8.0)
 
+## Overview
 
----
+This document describes the design for porting the `XMLToAvroBootstrapperForProfileStatGroups` Python tool to C# .NET 8.0. The tool reads a leaderboard XML config file, converts it into a target schema format, and optionally registers those schemas against a Confluent Schema Registry.
+
+The C# implementation generalises beyond Avro — the bootstrapper supports **Avro, JSON Schema, and Protobuf** as output formats, selected at runtime via configuration. Schema Registry API clients already exist in the codebase and will be called directly.
+
+-----
 
 ## Functional Requirements
 
@@ -8,57 +14,80 @@
 
 The tool accepts the following runtime inputs, provided via command-line arguments or a configuration object:
 
-| Parameter | Description |
-|---|---|
-| `env` | Deployment environment (e.g., `dev`, `prod`) |
-| `title` | Game title identifier (e.g., `hgt`, `rdr2`) |
-| `subject` | Kafka subject prefix (env is appended at runtime) |
-| `schemaFile` | Filename of the XML config (must be in same directory as executable) |
-| `registryUrl` | URL of the Confluent Schema Registry |
-| `updateRegistry` | Boolean flag; if true, schemas are pushed to registry. If false, dry-run only. |
+|Parameter            |Description                                                                   |
+|---------------------|------------------------------------------------------------------------------|
+|`env`                |Deployment environment (e.g., `dev`, `prod`)                                  |
+|`title`              |Game title identifier (e.g., `hgt`, `rdr2`)                                   |
+|`subject`            |Kafka subject prefix (env and title are appended at runtime)                  |
+|`schemaFile`         |Filename of the XML config (must be in same directory as executable)          |
+|`registryUrl`        |URL of the Confluent Schema Registry                                          |
+|`updateRegistry`     |Boolean flag; if true, schemas are pushed to registry. If false, dry-run only.|
+|`serializationFormat`|Target schema format: `Avro`, `Json`, or `Protobuf`                           |
 
 The XML config file follows the `LeaderboardsConfiguration` schema, containing `StatGroups`, `Inputs`, `Categories`, and `CategoryPermutations` sections.
 
 ### Outputs
 
-- One Avro schema (JSON) is generated per `StatGroup` found in the XML.
-- All schemas are written to a single local file: `{subject}_avro_schema.json`.
+- One schema is generated per `StatGroup` found in the XML, in the chosen serialization format.
+- All schemas are written to a local file: `{subject}_schema.{ext}` where `ext` is `json` (Avro/JSON Schema) or `proto` (Protobuf).
 - If `updateRegistry` is true, each schema is registered to the Schema Registry under the subject: `{subject}-{statGroupName}-value`.
+- The schema type passed to the registry (`AVRO`, `JSON`, `PROTOBUF`) is determined by the selected format.
 - Console output is produced at each major step for observability.
 
 ### Dry Run Mode
 
 When `updateRegistry` is false, the tool builds and writes schemas locally but does not call the Schema Registry. This is the default safe mode.
 
----
+-----
 
 ## Code Design
 
 ### Project Structure
 
 ```
-AvroBootstrapper/
+SchemaBootstrapper/
 ├── Interfaces/
 │   ├── IXmlParser.cs
-│   ├── IAvroSchemaBuilder.cs
+│   ├── ISchemaBuilder.cs
+│   ├── ISchemaBuilderFactory.cs
 │   ├── ITypeMapper.cs
 │   ├── ISchemaRegistrar.cs
 │   └── IBootstrapperApp.cs
 ├── Services/
 │   ├── XmlParser.cs
-│   ├── AvroSchemaBuilder.cs
-│   ├── TypeMapper.cs
+│   ├── Builders/
+│   │   ├── AvroSchemaBuilder.cs
+│   │   ├── JsonSchemaBuilder.cs
+│   │   └── ProtobufSchemaBuilder.cs
+│   ├── SchemaBuilderFactory.cs
+│   ├── TypeMappers/
+│   │   ├── AvroTypeMapper.cs
+│   │   ├── JsonTypeMapper.cs
+│   │   └── ProtobufTypeMapper.cs
 │   ├── SchemaRegistrar.cs
 │   └── BootstrapperApp.cs
 ├── Models/
 │   ├── BootstrapperOptions.cs
-│   └── AvroField.cs
+│   ├── SerializationFormat.cs
+│   ├── SchemaField.cs
+│   └── BuiltSchema.cs
 └── Program.cs
 ```
 
----
+-----
 
 ### Models
+
+**`SerializationFormat`** — enum for supported output formats.
+
+```csharp
+public enum SerializationFormat
+{
+    Avro,
+    Json,
+    Protobuf
+}
+```
 
 **`BootstrapperOptions`** — strongly-typed container for all CLI/config inputs.
 
@@ -71,23 +100,36 @@ public class BootstrapperOptions
     public string SchemaFile { get; set; }
     public string RegistryUrl { get; set; }
     public bool UpdateRegistry { get; set; }
+    public SerializationFormat SerializationFormat { get; set; }
     public bool DryRun => !UpdateRegistry;
     public string FullSubject => $"{Subject}_{Env}_{Title}";
 }
 ```
 
-**`AvroField`** — represents a single field in an Avro record schema.
+**`SchemaField`** — format-neutral representation of a single field, used internally before format-specific serialization.
 
 ```csharp
-public class AvroField
+public class SchemaField
 {
     public string Name { get; set; }
-    public object Type { get; set; }   // string or object[] for unions
-    public object Default { get; set; }
+    public string SqlType { get; set; }   // raw SQL type from XML
+    public bool Nullable { get; set; } = true;
+    public bool IsRatio { get; set; } = false;
 }
 ```
 
----
+**`BuiltSchema`** — the output of a schema builder for one stat group.
+
+```csharp
+public class BuiltSchema
+{
+    public string StatGroupName { get; set; }
+    public string SchemaContent { get; set; }   // serialized schema string (JSON or .proto)
+    public SerializationFormat Format { get; set; }
+}
+```
+
+-----
 
 ### Interfaces
 
@@ -103,58 +145,90 @@ public interface IXmlParser
 }
 ```
 
----
+-----
 
 #### `ITypeMapper`
 
-Maps SQL/primitive type strings to their corresponding Avro type representation. Handles upcasting (e.g., float → double) and logical types (e.g., datetime → timestamp-millis).
+Maps SQL/primitive type strings to their corresponding target-format type representation. Each serialization format has its own concrete implementation.
 
 ```csharp
 public interface ITypeMapper
 {
-    object GetAvroTypeForSqlType(string sqlType);
+    // Returns a format-specific type token.
+    // e.g. for Avro: "string", {"type":"long","logicalType":"timestamp-millis"}
+    // for JSON Schema: "string", "integer", "number"
+    // for Protobuf: "string", "int32", "int64", "double", "bool"
+    object GetTypeForSqlType(string sqlType);
+
+    SerializationFormat Format { get; }
 }
 ```
 
-Returns either a `string` (e.g., `"string"`, `"int"`) or a `Dictionary<string, string>` for logical types (e.g., `{ "type": "long", "logicalType": "timestamp-millis" }`).
+Concrete implementations:
 
----
+- `AvroTypeMapper` — returns Avro primitive types and logical type objects.
+- `JsonTypeMapper` — returns JSON Schema type strings.
+- `ProtobufTypeMapper` — returns Protobuf scalar type strings.
 
-#### `IAvroSchemaBuilder`
+-----
 
-Core interface responsible for transforming the parsed XML dictionary into a list of Avro schema records — one per stat group.
+#### `ISchemaBuilder`
+
+Core interface for building schemas from parsed XML data. Each serialization format has its own concrete implementation. All builders consume the same format-neutral `Dictionary<string, object>` input and produce a list of `BuiltSchema` objects.
 
 ```csharp
-public interface IAvroSchemaBuilder
+public interface ISchemaBuilder
 {
-    List<Dictionary<string, object>> BuildAvroSchema(Dictionary<string, object> jsonData);
+    SerializationFormat Format { get; }
+    List<BuiltSchema> BuildSchemas(Dictionary<string, object> parsedXml, string title);
 }
 ```
 
-Internally this orchestrates:
-- `GetBaseFieldSchema()` — builds the fixed base fields (handle, tag, time, guid, accountId, etc.)
-- `BuildCategories()` — resolves `CategoryPermutations` into Avro record fields
-- `BuildInputsAndAggregatedInputs()` — resolves `Columns` into input, aggregatedInputs, and aggregatedValues Avro record fields
-- `ProcessStatGroup()` — assembles a full Avro record for one stat group
-- `BuildComplexStatFields()` — resolves a single field by name from the Inputs/Categories data, with ratio fallback logic
+Concrete implementations:
 
-These are internal methods on `AvroSchemaBuilder` and do not need to be exposed on the interface.
+- `AvroSchemaBuilder` — produces Avro record schemas serialized as JSON.
+- `JsonSchemaBuilder` — produces JSON Schema (`$schema`, `properties`, `required`, etc.) serialized as JSON.
+- `ProtobufSchemaBuilder` — produces `.proto` syntax 3 message definitions as a string.
 
----
+Each builder internally handles:
+
+- `GetBaseFields()` — returns the fixed base fields (handle, tag, time, guid, accountId, etc.) in its own format.
+- `BuildCategories()` — resolves `CategoryPermutations` into format-specific field definitions.
+- `BuildInputs()` — resolves `Columns` into input, aggregatedInputs, and aggregatedValues fields.
+- `ProcessStatGroup()` — assembles the full schema for one stat group.
+
+These remain internal to each concrete builder.
+
+-----
+
+#### `ISchemaBuilderFactory`
+
+Resolves the correct `ISchemaBuilder` at runtime based on the configured `SerializationFormat`. This is the only place format-switching logic lives.
+
+```csharp
+public interface ISchemaBuilderFactory
+{
+    ISchemaBuilder GetBuilder(SerializationFormat format);
+}
+```
+
+The concrete `SchemaBuilderFactory` receives all registered `ISchemaBuilder` implementations via DI and selects the matching one by `Format`.
+
+-----
 
 #### `ISchemaRegistrar`
 
-Handles registration of compiled Avro schemas to the Schema Registry. Calls existing Schema Registry API clients in the codebase — no new HTTP logic is written here.
+Handles registration of compiled schemas to the Schema Registry. Format-aware: passes the correct schema type string (`AVRO`, `JSON`, `PROTOBUF`) when calling the existing registry client. No new HTTP logic is written here.
 
 ```csharp
 public interface ISchemaRegistrar
 {
-    Task RegisterAsync(string subjectName, string avroSchemaJson);
-    void PrintSchema(string subjectName, string avroSchemaJson);
+    Task RegisterAsync(string subjectName, BuiltSchema schema);
+    void PrintSchema(string subjectName, BuiltSchema schema);
 }
 ```
 
----
+-----
 
 #### `IBootstrapperApp`
 
@@ -167,22 +241,40 @@ public interface IBootstrapperApp
 }
 ```
 
-The concrete `BootstrapperApp` takes all other interfaces via constructor injection (DI-friendly).
+The concrete `BootstrapperApp` takes all other interfaces via constructor injection. It:
 
----
+1. Reads and parses the XML via `IXmlParser`.
+1. Resolves the correct builder via `ISchemaBuilderFactory`.
+1. Builds all schemas via `ISchemaBuilder`.
+1. Writes schemas to disk.
+1. Conditionally registers via `ISchemaRegistrar` based on `DryRun`.
+
+-----
 
 ### Dependency Injection
 
-All interfaces are registered in `Program.cs` using .NET 8.0's built-in DI:
+All interfaces are registered in `Program.cs` using .NET 8.0’s built-in DI. All three builders and type mappers are registered so the factory can resolve any of them at runtime:
 
 ```csharp
 var host = Host.CreateDefaultBuilder(args)
     .ConfigureServices((ctx, services) =>
     {
         services.Configure<BootstrapperOptions>(ctx.Configuration);
-        services.AddSingleton<ITypeMapper, TypeMapper>();
+
+        // XML parsing
         services.AddSingleton<IXmlParser, XmlParser>();
-        services.AddSingleton<IAvroSchemaBuilder, AvroSchemaBuilder>();
+
+        // Type mappers — all registered, factory picks the right one
+        services.AddSingleton<ITypeMapper, AvroTypeMapper>();
+        services.AddSingleton<ITypeMapper, JsonTypeMapper>();
+        services.AddSingleton<ITypeMapper, ProtobufTypeMapper>();
+
+        // Schema builders — all registered, factory picks the right one
+        services.AddSingleton<ISchemaBuilder, AvroSchemaBuilder>();
+        services.AddSingleton<ISchemaBuilder, JsonSchemaBuilder>();
+        services.AddSingleton<ISchemaBuilder, ProtobufSchemaBuilder>();
+
+        services.AddSingleton<ISchemaBuilderFactory, SchemaBuilderFactory>();
         services.AddSingleton<ISchemaRegistrar, SchemaRegistrar>();
         services.AddSingleton<IBootstrapperApp, BootstrapperApp>();
     })
@@ -191,19 +283,33 @@ var host = Host.CreateDefaultBuilder(args)
 await host.Services.GetRequiredService<IBootstrapperApp>().RunAsync();
 ```
 
----
+-----
+
+## Format Behaviour Summary
+
+|Concern              |Avro                                              |JSON Schema                             |Protobuf                   |
+|---------------------|--------------------------------------------------|----------------------------------------|---------------------------|
+|Field nullability    |`["null", type]` union                            |`type: [type, "null"]`                  |`optional` keyword         |
+|Timestamp type       |`{"type":"long","logicalType":"timestamp-millis"}`|`{"type":"string","format":"date-time"}`|`google.protobuf.Timestamp`|
+|Integer types        |`"int"` / `"long"`                                |`"integer"`                             |`int32` / `int64`          |
+|Float/decimal        |`"double"`                                        |`"number"`                              |`double`                   |
+|Registry type string |`AVRO`                                            |`JSON`                                  |`PROTOBUF`                 |
+|Output file extension|`.json`                                           |`.json`                                 |`.proto`                   |
+
+-----
 
 ## Key Behavioural Notes
 
-- **Title-specific logic**: When `title == "rdr2"`, the stat dict includes a `posseInfo` field with a hardcoded `id: long` field. This is handled inside `ProcessStatGroup` with a simple conditional, identical to the Python version.
-- **Nullable Avro fields**: All fields use the union type `["null", <type>]` with `default: null`, matching the Python output.
-- **Type safety**: `object` is used for Avro `type` values since they can be strings or nested objects. Serialization to JSON uses `System.Text.Json`.
-- **Schema Registry calls**: `SchemaRegistrar` will call the existing `ISchemaRegistryClient` (already in codebase) — no new client is introduced.
+- **Title-specific logic**: When `title == "rdr2"`, the stat group includes a hardcoded `posseInfo` record with an `id: long` field. This is handled inside `ProcessStatGroup` on each concrete builder.
+- **Nullable fields**: All fields default to nullable across all formats, matching the Python Avro output behaviour.
+- **`ISchemaBuilderFactory` is the only format switch**: No `if/switch` on format exists anywhere else in the codebase.
+- **Schema Registry calls**: `SchemaRegistrar` calls the existing `ISchemaRegistryClient` already in the codebase. The only addition is passing the correct format type string per `BuiltSchema.Format`.
 
----
+-----
 
 ## Out of Scope
 
 - No changes to Schema Registry API clients.
 - No XML schema validation (matches current Python behaviour).
-- No support for complex nested Avro types beyond what the Python tool currently handles (tracked as a ToDo in the original code).
+- No support for complex nested Avro types beyond what the Python tool currently handles (tracked as a ToDo in the original).
+- No runtime format conversion between Avro, JSON Schema, and Protobuf.
